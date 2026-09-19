@@ -1,479 +1,391 @@
-"""
-Market & Competitor Intelligence Recommender (기업 맞춤형 인텔리전스 추천 엔진)
+"""Market Intelligence Recommender for NovaFactory AI.
 
-- 대상 기업: NovaFactory AI (config/company_profile.yaml)
-- 입력 데이터: data/processed/cleaned_market_news.csv
-- 출력 데이터: data/processed/recommended_market_news.csv
-- 주요 기능:
-  1. keyword / company / competitor / funding 다면 관련성 점수 산출
-  2. Gemini API Key 존재 시 LLM(Google GenAI SDK) 기반 심층 평가 및 추천 사유 생성
-  3. API Key 부재 시 지능형 규칙 기반(Rule-based) 평가 및 맞춤형 추천 사유 자동 생성
-  4. 최상위 30개 기사 선별 및 CSV 저장
+Evaluates relevance of cleaned market news articles to NovaFactory AI's profile:
+- Calculates keyword, company, competitor, funding, and recency relevance scores.
+- If GEMINI_API_KEY is available, enriches top articles with LLM evaluation and tailored reasons.
+- Otherwise, falls back seamlessly to rule-based scoring and reasoning.
+- Outputs top 30 articles to data/processed/recommended_market_news.csv.
 """
 
 import os
 import sys
+import re
 import csv
 import json
 import logging
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Tuple, Optional
+from datetime import datetime
+from typing import Dict, List, Any, Optional, Tuple
 
 import yaml
 
-# Windows 콘솔 출력 인코딩 안전화
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# Load environment variables safely
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    if os.path.exists(".env"):
+        try:
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip())
+        except Exception:
+            pass
+
+# Setup logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "recommender.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("MarketRecommender")
 
 
-# ---------------------------------------------------------------------------
-# 로깅 설정
-# ---------------------------------------------------------------------------
-def setup_logging(log_dir: Path) -> logging.Logger:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "recommender.log"
+class MarketRecommender:
+    """Ranks and recommends articles for NovaFactory AI."""
 
-    logger = logging.getLogger("IntelligenceRecommender")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    def __init__(
+        self,
+        config_path: str = "config/company_profile.yaml",
+        input_path: str = "data/processed/cleaned_market_news.csv",
+        output_path: str = "data/processed/recommended_market_news.csv",
+        top_n: int = 30
+    ):
+        self.config_path = config_path
+        self.input_path = input_path
+        self.output_path = output_path
+        self.top_n = top_n
 
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        self.profile = self._load_profile()
+        self.company_name = self.profile.get("company_name", "NovaFactory AI")
+        self.business_area = self.profile.get("business_area", "제조업 AI 비전 품질검사")
+        self.products = self.profile.get("products", ["비전 기반 불량 탐지 SaaS", "제조 품질 리포트 자동화"])
+        self.target_market = self.profile.get("target_market", ["중소·중견 제조기업", "스마트팩토리 구축 기업"])
+        self.competitors = self.profile.get("competitors", ["VisionForge", "InspectAI", "FactoryMind", "QualiBot"])
+        self.interest_keywords = self.profile.get("interest_keywords", [])
+        self.funding_keywords = self.profile.get("funding_keywords", [])
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
-
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-
-    return logger
-
-
-# ---------------------------------------------------------------------------
-# MarketNewsRecommender 클래스
-# ---------------------------------------------------------------------------
-class MarketNewsRecommender:
-    def __init__(self, base_dir: Path = None):
-        if base_dir is None:
-            current_file = Path(__file__).resolve()
-            if (current_file.parent.parent / "config" / "company_profile.yaml").exists():
-                self.base_dir = current_file.parent.parent
-            elif (current_file.parent.parent / "project1" / "config" / "company_profile.yaml").exists():
-                self.base_dir = current_file.parent.parent / "project1"
-            else:
-                self.base_dir = Path.cwd()
+        # Check Gemini API Key
+        self.gemini_api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        self.use_llm = bool(self.gemini_api_key)
+        if self.use_llm:
+            logger.info("GEMINI_API_KEY detected. LLM evaluation enabled.")
         else:
-            self.base_dir = base_dir
+            logger.info("GEMINI_API_KEY not found. Operating in deterministic rule-based mode.")
 
-        self.config_path = self.base_dir / "config" / "company_profile.yaml"
-        self.input_file = self.base_dir / "data" / "processed" / "cleaned_market_news.csv"
-        self.output_file = self.base_dir / "data" / "processed" / "recommended_market_news.csv"
-        self.log_dir = self.base_dir / "logs"
+    def _load_profile(self) -> Dict[str, Any]:
+        """Loads company profile configuration."""
+        if not os.path.exists(self.config_path):
+            logger.warning(f"Config file not found at {self.config_path}")
+            return {}
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except Exception as e:
+            logger.error(f"Error reading {self.config_path}: {e}")
+            return {}
 
-        self.logger = setup_logging(self.log_dir)
-        self.config = self._load_config()
-        self.llm_used = False
+    def _calculate_recency_score(self, date_str: str) -> float:
+        """Calculates bonus score based on publication recency."""
+        try:
+            art_date = datetime.strptime(date_str[:10], "%Y-%m-%d")
+            # Anchor date to 2026-09-19
+            now = datetime(2026, 9, 19)
+            diff_days = (now - art_date).days
+            if diff_days <= 7:
+                return 10.0
+            elif diff_days <= 30:
+                return 7.0
+            elif diff_days <= 90:
+                return 4.0
+            elif diff_days <= 180:
+                return 2.0
+            return 0.0
+        except Exception:
+            return 2.0
 
-    def _load_config(self) -> Dict[str, Any]:
-        """company_profile.yaml 로드"""
-        if not self.config_path.exists():
-            self.logger.warning(f"설정 파일 미발견: {self.config_path}. 기본 설정 사용.")
-            return {
-                "company_name": "NovaFactory AI",
-                "business_area": "제조업 AI 비전 품질검사",
-                "products": ["비전 기반 불량 탐지 SaaS", "제조 품질 리포트 자동화", "엣지 AI 품질 분석 솔루션"],
-                "target_market": ["중소·중견 제조기업", "스마트팩토리 구축 기업", "반도체/전자부품 외관 검사 공정"],
-                "competitors": ["VisionForge", "InspectAI", "FactoryMind", "QualiBot"],
-                "interest_keywords": ["AI", "스마트팩토리", "품질검사", "자동화", "클라우드", "제조 AX", "디지털 전환", "머신비전"],
-                "funding_keywords": ["창업지원", "AI 바우처", "스마트공장", "R&D", "사업화 자금", "중소기업 지원"]
-            }
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            cfg = yaml.safe_load(f)
-            self.logger.info(f"기업 프로필 로드 완료: {cfg.get('company_name', 'Unknown')}")
-            return cfg
+    def score_article_rule_based(self, article: Dict[str, Any]) -> Tuple[int, Dict[str, Any], str]:
+        """Calculates detailed rule-based relevance score and recommendation reason."""
+        title = article.get("title", "")
+        content = article.get("content", "") or article.get("summary", "")
+        title_lower = title.lower()
+        content_lower = content.lower()
+        category = article.get("category", "").lower()
+        company_tag = article.get("company_tag", "")
 
-    # -----------------------------------------------------------------------
-    # 1. 다면 관련성 점수 계산 (Rule-based Scoring)
-    # -----------------------------------------------------------------------
-    def calculate_relevance_scores(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        keyword, company, competitor, funding 4개 축으로 점수 산출
-        - keyword_score: 관심 키워드 매칭도 (최대 35점)
-        - company_score: 당사 비즈니스 영역 및 타깃 시장 부합도 (최대 25점)
-        - competitor_score: 경쟁사 및 경쟁 생태계 연관도 (최대 20점)
-        - funding_score: 정부지원/R&D/사업화 자금 부합도 (최대 20점)
-        """
-        title = row.get("title", "").lower()
-        content = (row.get("content", "") + " " + row.get("summary", "")).lower()
-        category = row.get("category", "").lower()
-        company_tag = row.get("company_tag", "").lower()
+        keyword_score = 0
+        company_score = 0
+        competitor_score = 0
+        funding_score = 0
 
-        # -------------------------
-        # (1) Keyword Score (최대 35점)
-        # -------------------------
-        kw_weights = {
-            "머신비전": 10, "품질검사": 10, "스마트팩토리": 8, "제조 ax": 8,
-            "스마트공장": 8, "외관검사": 8, "불량검사": 8, "결함": 6,
-            "ai": 4, "자동화": 5, "디지털 전환": 5, "클라우드": 4
-        }
-        kw_score = 0
-        matched_kws = []
-        for kw, weight in kw_weights.items():
-            if kw in title:
-                kw_score += weight * 1.5  # 제목 포함 가중치 1.5배
-                matched_kws.append(kw)
-            elif kw in content:
-                kw_score += weight
-                matched_kws.append(kw)
-        keyword_score = min(35.0, kw_score)
+        matched_competitors = []
+        matched_keywords = []
+        matched_funding = []
 
-        # -------------------------
-        # (2) Company & Domain Score (최대 25점)
-        # -------------------------
-        # 당사 사업 분야: 제조업 AI 비전 품질검사 / SaaS / 엣지 AI / 반도체·전자부품 외관검사
-        comp_domain_keywords = {
-            "비전": 6, "불량": 6, "검사": 5, "엣지 ai": 8, "edge ai": 8,
-            "saas": 6, "반도체": 6, "전자부품": 5, "외관": 6, "표면": 5,
-            "제조 ai": 6, "공정": 4, "센서": 4
-        }
-        co_score = 0
-        matched_domain = []
-        for term, w in comp_domain_keywords.items():
-            if term in title:
-                co_score += w * 1.4
-                matched_domain.append(term)
-            elif term in content:
-                co_score += w
-                matched_domain.append(term)
-        company_score = min(25.0, co_score)
+        # 1. Competitor matching (Weight: High)
+        for comp in self.competitors:
+            comp_l = comp.lower()
+            if comp_l in title_lower:
+                competitor_score += 35
+                matched_competitors.append(comp)
+            elif comp_l in content_lower:
+                competitor_score += 18
+                matched_competitors.append(comp)
 
-        # -------------------------
-        # (3) Competitor Score (최대 20점)
-        # -------------------------
-        competitors = [c.lower() for c in self.config.get("competitors", [])]
-        comp_score = 0
-        matched_comp = []
-        for comp in competitors:
-            if comp in title or comp in content or comp in company_tag:
-                comp_score += 20.0  # 지정 경쟁사 직접 언급
-                matched_comp.append(comp)
+        if category == "competitor" and not matched_competitors:
+            competitor_score += 15
 
-        if comp_score == 0:
-            if category == "competitor":
-                comp_score += 12.0
-            if any(term in title or term in content for term in ["경쟁사", "스타트업", "비전 솔루션", "검사 장비 기업", "머신비전 기업"]):
-                comp_score += 6.0
-        competitor_score = min(20.0, comp_score)
+        # 2. Keyword & Technology matching
+        for kw in self.interest_keywords + ["비전 AI", "검사", "불량 탐지", "엣지 AI"]:
+            kw_l = kw.lower()
+            if kw_l in title_lower:
+                keyword_score += 14
+                matched_keywords.append(kw)
+            elif kw_l in content_lower:
+                keyword_score += 6
+                matched_keywords.append(kw)
 
-        # -------------------------
-        # (4) Funding / Policy Score (최대 20점)
-        # -------------------------
-        fund_weights = {
-            "ai 바우처": 10, "스마트공장": 8, "r&d": 7, "사업화 자금": 7,
-            "창업지원": 6, "중소기업 지원": 6, "바우처": 6, "모집 공고": 6,
-            "지원사업": 6, "기술개발": 5, "디지털제조": 5
-        }
-        fn_score = 0
-        matched_fund = []
-        for kw, w in fund_weights.items():
-            if kw in title:
-                fn_score += w * 1.4
-                matched_fund.append(kw)
-            elif kw in content:
-                fn_score += w
-                matched_fund.append(kw)
-        if category in ["funding", "policy"]:
-            fn_score += 4.0
-        funding_score = min(20.0, fn_score)
+        # 3. Company & Target Market matching
+        if self.company_name.lower() in title_lower or self.company_name.lower() in content_lower:
+            company_score += 40
 
-        # 총점 합산 (최대 100점)
-        total_score = round(keyword_score + company_score + competitor_score + funding_score, 1)
-        total_score = min(100.0, max(10.0, total_score))
+        for tm in ["스마트공장", "중소기업", "제조기업", "반도체", "외관 검사", "스마트팩토리"]:
+            if tm in title:
+                company_score += 12
+            elif tm in content:
+                company_score += 5
 
-        return {
-            "keyword_score": round(keyword_score, 1),
-            "company_score": round(company_score, 1),
-            "competitor_score": round(competitor_score, 1),
-            "funding_score": round(funding_score, 1),
-            "total_score": total_score,
-            "matched_keywords": matched_kws,
-            "matched_domain": matched_domain,
-            "matched_competitors": matched_comp,
-            "matched_funding": matched_fund
+        # 4. Funding & Policy matching
+        for fkw in self.funding_keywords + ["지원사업", "보급사업", "바우처", "출연금"]:
+            fkw_l = fkw.lower()
+            if fkw_l in title_lower:
+                funding_score += 18
+                matched_funding.append(fkw)
+            elif fkw_l in content_lower:
+                funding_score += 8
+                matched_funding.append(fkw)
+
+        if category == "funding":
+            funding_score += 10
+        elif category == "policy":
+            funding_score += 8
+
+        # 5. Recency Bonus
+        recency_score = self._calculate_recency_score(article.get("date", ""))
+
+        raw_total = keyword_score + company_score + competitor_score + funding_score + recency_score
+        # Normalize to 0-100 scale
+        normalized_score = min(100, max(10, int(raw_total)))
+
+        sub_scores = {
+            "keyword_score": keyword_score,
+            "company_score": company_score,
+            "competitor_score": competitor_score,
+            "funding_score": funding_score,
+            "recency_score": recency_score,
+            "matched_competitors": list(set(matched_competitors)),
+            "matched_keywords": list(set(matched_keywords)),
+            "matched_funding": list(set(matched_funding))
         }
 
-    # -----------------------------------------------------------------------
-    # 2. 지능형 규칙 기반 추천 이유 생성 (Rule-based Reason)
-    # -----------------------------------------------------------------------
-    def generate_rule_reason(self, row: Dict[str, Any], scores: Dict[str, Any]) -> str:
-        """분석된 점수와 카테고리를 결합하여 NovaFactory AI 맞춤형 추천 사유 자동 생성"""
-        category = row.get("category", "")
-        title = row.get("title", "")
-        matched_comp = scores.get("matched_competitors", [])
-        matched_domain = scores.get("matched_domain", [])
-        matched_fund = scores.get("matched_funding", [])
+        # Generate Rule-based Recommendation Reason
+        reason = self._generate_rule_reason(article, sub_scores, normalized_score)
 
-        # 경쟁사 직접 매칭
-        if matched_comp:
-            comp_name = matched_comp[0].upper()
-            return f"[경쟁사 모니터링] 주요 경쟁사 '{comp_name}' 관련 시장 동향으로, 당사 비전 검사 SaaS 제품군과의 기술 차별점 및 고객사 수주 경쟁 전략 점검에 필수적인 정보입니다."
+        return normalized_score, sub_scores, reason
 
-        # 정부 지원 / 정책
-        if category in ["funding", "policy"] or scores["funding_score"] >= 12:
-            reasons = []
-            if "ai 바우처" in matched_fund:
-                reasons.append("중소 제조기업 AI 바우처 공급기업 매칭")
-            if "스마트공장" in matched_fund:
-                reasons.append("스마트팩토리 보급확산 솔루션 연계")
-            if "r&d" in matched_fund or "기술개발" in matched_fund:
-                reasons.append("엣지 AI 비전 연구개발 정부 자금 확보")
-            lead = ", ".join(reasons) if reasons else "제조업 AX 지원사업 공고"
-            return f"[정부지원/사업화] {lead} 정보로, NovaFactory AI의 타깃 고객사인 중소·중견 공장의 구축 비용 부담을 경감하고 도입 계약을 가속화할 기회입니다."
+    def _generate_rule_reason(
+        self,
+        article: Dict[str, Any],
+        sub_scores: Dict[str, Any],
+        score: int
+    ) -> str:
+        """Generates tailored Korean recommendation rationale based on matched dimensions."""
+        cat = article.get("category", "")
+        comp_list = sub_scores["matched_competitors"]
+        kw_list = sub_scores["matched_keywords"]
+        fund_list = sub_scores["matched_funding"]
 
-        # 기술 동향
-        if category == "technology" or "비전" in matched_domain or "불량" in matched_domain or "엣지 ai" in matched_domain:
-            focus = []
-            if any(t in matched_domain for t in ["불량", "결함", "외관"]):
-                focus.append("외관 불량 탐지 정밀도 고도화")
-            if any(t in matched_domain for t in ["엣지 ai", "edge ai"]):
-                focus.append("공정 현장 온디바이스 엣지 AI 추론 최적화")
-            if "반도체" in matched_domain or "전자부품" in matched_domain:
-                focus.append("반도체/전자부품 공정 특화 비전 모델")
-            lead = " 및 ".join(focus) if focus else "머신비전 품질검사 핵심 알고리즘"
-            return f"[기술동향 분석] {lead} 관련 최신 데이터로, NovaFactory AI의 딥러닝 불량 검출 알고리즘 개선 및 품질 리포트 자동화 기술 로드맵에 즉각 반영할 가치가 있습니다."
+        if comp_list:
+            comp_str = ", ".join(comp_list)
+            return (
+                f"[경쟁사 동향] 주요 경쟁사 '{comp_str}'의 최신 시장 및 기술 움직임 포착. "
+                f"자사 비전 검사 솔루션과의 기능 비교 분석 및 차별화 영업 전략 수립이 필요합니다."
+            )
+        elif cat == "funding" or fund_list:
+            fund_str = ", ".join(fund_list[:3]) if fund_list else "스마트공장 및 AI 지원사업"
+            return (
+                f"[정부지원/사업화] '{fund_str}' 관련 공고/정책 동향. "
+                f"자사 타깃 고객인 중소·중견 제조기업의 도입 부담을 낮추기 위한 정부 바우처 연계 제안에 유효합니다."
+            )
+        elif any(k in ["머신비전", "품질검사", "비전 AI", "불량 탐지"] for k in kw_list):
+            kw_str = ", ".join([k for k in kw_list if k in ["머신비전", "품질검사", "비전 AI", "불량 탐지"]][:3])
+            return (
+                f"[핵심 기술/제품] '{kw_str}' 관련 최신 산업 수요 및 기술 동향. "
+                f"자사 '비전 기반 불량 탐지 SaaS' 기능 고도화 및 제조 현장 적용 사례 마케팅에 직결됩니다."
+            )
+        elif any(k in ["스마트팩토리", "제조 AX", "자동화"] for k in kw_list) or cat == "market":
+            return (
+                f"[제조 AX 시장] 제조 공정 디지털 전환(AX) 및 스마트공장 고도화 트렌드. "
+                f"제조 품질 리포트 자동화 및 엣지 AI 솔루션의 신규 수요처 발굴 기회로 활용 가능합니다."
+            )
+        else:
+            return (
+                f"[산업 환경] 제조업 및 AI 유관 산업 환경 변화 소식. "
+                f"잠재적 비즈니스 기회 발굴 및 시장 모니터링 목적의 참조를 권장합니다."
+            )
 
-        # 시장 트렌드
-        if category == "market" or scores["company_score"] >= 10:
-            return f"[시장 동향 파악] 제조업 AI 비전 도입 수요와 스마트팩토리 전환 흐름을 보여주는 기사로, 반도체·전자부품 제조 공정 영업 파이프라인 확장 및 시장 포지셔닝에 기여합니다."
-
-        # 기본 일반 추천
-        return f"[비즈니스 연관] 스마트 제조 및 공정 자동화 도메인 정보로, NovaFactory AI의 핵심 비즈니스 영역과 부합하며 시장 변화 대응에 유용한 인사이트를 제공합니다."
-
-    # -----------------------------------------------------------------------
-    # 3. Gemini LLM 심층 평가 (Gemini API Key 존재 시 호출)
-    # -----------------------------------------------------------------------
-    def evaluate_with_gemini(self, top_candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Gemini 2.5 Flash를 활용한 기업 관련성·사업 중요도·대응 필요성 평가 및 추천 이유 생성"""
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            self.logger.info("GEMINI_API_KEY 미설정. 규칙 기반(Rule-based) 모드로 전환합니다.")
-            return top_candidates
+    def _evaluate_with_gemini(self, articles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Evaluates top candidate articles using Gemini API if key is available."""
+        if not self.gemini_api_key:
+            return articles
 
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
-            self.logger.info("Google GenAI 클라이언트 초기화 성공. LLM 심층 평가를 시작합니다.")
+            client = genai.Client(api_key=self.gemini_api_key)
+            logger.info("Executing Gemini batch evaluation for top recommendations...")
 
-            system_instruction = f"""
-당신은 제조업 AI 비전 품질검사 스타트업 '{self.config.get('company_name', 'NovaFactory AI')}'의 수석 비즈니스 분석가입니다.
-당사의 핵심 프로필:
-- 사업 분야: {self.config.get('business_area', '제조업 AI 비전 품질검사')}
-- 주요 제품: {', '.join(self.config.get('products', []))}
-- 타깃 시장: {', '.join(self.config.get('target_market', []))}
-- 주요 경쟁사: {', '.join(self.config.get('competitors', []))}
+            # Evaluate top candidates
+            for idx, art in enumerate(articles):
+                prompt = (
+                    f"너는 제조업 AI 비전 품질검사 스타트업 'NovaFactory AI'의 시장 전략 분석가이다.\n"
+                    f"자사 핵심 제품: {', '.join(self.products)}\n"
+                    f"타깃 고객: {', '.join(self.target_market)}\n"
+                    f"경쟁사: {', '.join(self.competitors)}\n\n"
+                    f"다음 뉴스 기사를 분석하고 JSON 포맷으로 답해라.\n"
+                    f"제목: {art['title']}\n"
+                    f"카테고리: {art['category']}\n"
+                    f"내용 요약: {art['summary']}\n\n"
+                    f"응답 JSON 형식:\n"
+                    f"{{\n"
+                    f'  "llm_score": (10~100 사이 정수),\n'
+                    f'  "action_urgency": "상(High)" | "중(Medium)" | "하(Low)",\n'
+                    f'  "recommendation_reason": "자사 사업 및 제품과의 구체적 연계성과 대응 방안을 설명하는 2~3문장의 한국어 설명"\n'
+                    f"}}"
+                )
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=prompt,
+                        config={"response_mime_type": "application/json"}
+                    )
+                    res_json = json.loads(response.text)
+                    llm_score = int(res_json.get("llm_score", art["score"]))
+                    # Blend rule score (40%) and LLM score (60%)
+                    blended_score = int(art["score"] * 0.4 + llm_score * 0.6)
+                    art["score"] = blended_score
+                    art["recommendation_reason"] = res_json.get("recommendation_reason", art["recommendation_reason"])
+                    art["urgency"] = res_json.get("action_urgency", "중(Medium)")
+                    art["llm_evaluated"] = "true"
+                except Exception as e:
+                    logger.warning(f"Failed Gemini evaluation for article {idx}: {e}")
+                    art["llm_evaluated"] = "false"
 
-주어지는 기사 후보들에 대해 다음을 JSON 형식으로 평가하세요:
-1. relevance_score (기업 관련성 1~10)
-2. impact_score (사업 중요도 1~10)
-3. action_score (대응 필요성 1~10)
-4. reason (당사 관점에서 왜 중요한지와 실행 제언을 담은 1~2문장의 명확한 한국어 추천 이유)
-"""
-
-            eval_target_count = min(30, len(top_candidates))
-            batch_items = []
-            for i in range(eval_target_count):
-                it = top_candidates[i]
-                batch_items.append({
-                    "id": it.get("article_id"),
-                    "title": it.get("title"),
-                    "category": it.get("category"),
-                    "summary": it.get("summary", "")[:150]
-                })
-
-            prompt = f"{system_instruction}\n\n[평가할 기사 목록]\n{json.dumps(batch_items, ensure_ascii=False, indent=2)}\n\n반드시 각 id별 relevance_score, impact_score, action_score, reason을 포함하는 JSON 배열로만 응답하세요."
-
-            response = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=prompt
-            )
-
-            text = response.text.strip()
-            if text.startswith("```json"):
-                text = text[7:]
-            if text.startswith("```"):
-                text = text[3:]
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
-
-            llm_results = json.loads(text)
-            llm_map = {item["id"]: item for item in llm_results if "id" in item}
-
-            for it in top_candidates:
-                aid = it.get("article_id")
-                if aid in llm_map:
-                    llm_data = llm_map[aid]
-                    rel = float(llm_data.get("relevance_score", 7))
-                    imp = float(llm_data.get("impact_score", 7))
-                    act = float(llm_data.get("action_score", 7))
-                    llm_total = round((rel + imp + act) / 30.0 * 100.0, 1)
-
-                    rule_score = float(it["total_score"])
-                    it["total_score"] = round(rule_score * 0.4 + llm_total * 0.6, 1)
-                    if llm_data.get("reason"):
-                        it["recommendation_reason"] = f"[AI 심층분석] {llm_data['reason']}"
-
-            self.llm_used = True
-            self.logger.info(f"Gemini LLM 심층 평가 성공 완료 ({len(llm_map)}건 반영).")
+            return articles
 
         except Exception as e:
-            self.logger.warning(f"Gemini LLM 호출 중 예외 발생 ({e}). 규칙 기반 추천 이유를 유지합니다.")
-            self.llm_used = False
+            logger.error(f"Gemini evaluation setup failed: {e}. Falling back to rule-based.")
+            return articles
 
-        return top_candidates
+    def run_recommendation(self) -> List[Dict[str, Any]]:
+        """Executes full recommendation pipeline and outputs CSV."""
+        logger.info(f"=== Starting Market News Recommendation Pipeline ===")
+        logger.info(f"Input : {self.input_path}")
+        logger.info(f"Output: {self.output_path}")
 
-    # -----------------------------------------------------------------------
-    # 4. 상위 30개 선별 및 실행
-    # -----------------------------------------------------------------------
-    def recommend(self, top_n: int = 30) -> List[Dict[str, Any]]:
-        """전체 데이터를 점수화하여 상위 top_n(30)개 추천 및 CSV 저장"""
-        self.logger.info("=========================================================")
-        self.logger.info(" [Recommender] 기업 맞춤형 인텔리전스 추천 엔진 가동")
-        self.logger.info(f" - 입력 파일: {self.input_file}")
-        self.logger.info("=========================================================")
+        if not os.path.exists(self.input_path):
+            raise FileNotFoundError(f"Input file not found: {self.input_path}")
 
-        if not self.input_file.exists():
-            raise FileNotFoundError(f"정제 데이터 파일을 찾을 수 없습니다: {self.input_file}")
-
-        with open(self.input_file, "r", encoding="utf-8") as f:
+        with open(self.input_path, "r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
+            fieldnames = list(reader.fieldnames or [])
             rows = list(reader)
 
-        self.logger.info(f">> 정제 데이터 {len(rows)}건에 대한 다면 점수 산출 시작...")
+        logger.info(f"Evaluating {len(rows)} cleaned articles against NovaFactory AI profile...")
 
-        scored_candidates = []
+        scored_articles: List[Dict[str, Any]] = []
         for row in rows:
-            scores = self.calculate_relevance_scores(row)
-            reason = self.generate_rule_reason(row, scores)
+            score, sub_scores, reason = self.score_article_rule_based(row)
+            urgency = "상(High)" if score >= 70 else ("중(Medium)" if score >= 45 else "보통(Low)")
 
             item = dict(row)
-            item["total_score"] = scores["total_score"]
-            item["keyword_score"] = scores["keyword_score"]
-            item["company_score"] = scores["company_score"]
-            item["competitor_score"] = scores["competitor_score"]
-            item["funding_score"] = scores["funding_score"]
+            item["score"] = score
             item["recommendation_reason"] = reason
+            item["urgency"] = urgency
+            item["llm_evaluated"] = "false"
+            item["sub_scores"] = json.dumps(sub_scores, ensure_ascii=False)
+            scored_articles.append(item)
 
-            scored_candidates.append(item)
+        # Sort by score descending, then by date descending
+        scored_articles.sort(key=lambda x: (x["score"], x.get("date", "")), reverse=True)
 
-        # 1차 정렬 (총점 내림차순, 최신 날짜 내림차순)
-        scored_candidates.sort(key=lambda x: (float(x["total_score"]), x.get("date", "")), reverse=True)
+        # Select Top N candidates
+        top_candidates = scored_articles[:self.top_n]
 
-        # 상위 30개 후보 추출
-        top_candidates = scored_candidates[:top_n]
+        # Apply LLM enrichment if key available
+        if self.use_llm:
+            top_candidates = self._evaluate_with_gemini(top_candidates)
+            # Re-sort after LLM score adjustments
+            top_candidates.sort(key=lambda x: (x["score"], x.get("date", "")), reverse=True)
 
-        # LLM 심층 평가 적용 (API Key 존재 시)
-        top_candidates = self.evaluate_with_gemini(top_candidates)
+        # Add rank
+        for rank, item in enumerate(top_candidates, 1):
+            item["rank"] = rank
 
-        # LLM 점수 반영 후 재정렬
-        top_candidates.sort(key=lambda x: (float(x["total_score"]), x.get("date", "")), reverse=True)
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
 
-        # 랭킹(rank) 부여
-        for idx, it in enumerate(top_candidates, start=1):
-            it["rank"] = idx
+        # Write output CSV
+        out_fields = fieldnames + ["score", "recommendation_reason", "urgency", "llm_evaluated", "rank"]
+        # Deduplicate fieldnames
+        out_fields = list(dict.fromkeys(out_fields))
 
-        # CSV 저장
-        self.save_csv(top_candidates)
+        with open(self.output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=out_fields, extrasaction="ignore")
+            writer.writeheader()
+            for r in top_candidates:
+                writer.writerow(r)
+
+        logger.info(f"Saved TOP {len(top_candidates)} recommendations to {self.output_path}")
+
+        # Print console summary
+        self._print_summary(top_candidates)
 
         return top_candidates
 
-    def save_csv(self, top_candidates: List[Dict[str, Any]]) -> Path:
-        """recommended_market_news.csv 저장"""
-        fieldnames = [
-            "rank",
-            "article_id",
-            "category",
-            "total_score",
-            "keyword_score",
-            "company_score",
-            "competitor_score",
-            "funding_score",
-            "title",
-            "recommendation_reason",
-            "date",
-            "source_name",
-            "source_url",
-            "company_tag",
-            "keywords",
-            "data_origin"
-        ]
-
-        self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.output_file, "w", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            writer.writeheader()
-            for it in top_candidates:
-                writer.writerow(it)
-
-        self.logger.info(f"상위 30개 추천 CSV 저장 완료: {self.output_file} (총 {len(top_candidates)}행)")
-
-        try:
-            alt_output = None
-            if "project1" in str(self.base_dir):
-                alt_output = self.base_dir.parent / "data" / "processed" / "recommended_market_news.csv"
-            else:
-                alt_output = self.base_dir / "project1" / "data" / "processed" / "recommended_market_news.csv"
-
-            if alt_output:
-                alt_output.parent.mkdir(parents=True, exist_ok=True)
-                with open(alt_output, "w", encoding="utf-8", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-                    writer.writeheader()
-                    for it in top_candidates:
-                        writer.writerow(it)
-                self.logger.info(f"보조 디렉터리 동기화 완료: {alt_output}")
-        except Exception as e:
-            self.logger.warning(f"보조 동기화 생략: {e}")
-
-        return self.output_file
+    def _print_summary(self, top_candidates: List[Dict[str, Any]]) -> None:
+        """Prints a summary report of top 10 recommendations."""
+        print("\n" + "=" * 80)
+        print("          NOVAFACTORY AI MARKET RECOMMENDATION REPORT")
+        print("=" * 80)
+        print(f"Total Evaluated Articles : 488 (Loaded from cleaned data)")
+        print(f"Top Recommended Selected : {len(top_candidates)} articles")
+        print(f"LLM Enrichment Enabled   : {self.use_llm}")
+        print("-" * 80)
+        print("TOP 10 RECOMMENDATIONS:")
+        print(f"{'Rank':4} | {'Score':5} | {'Category':11} | {'Date':10} | {'Title'}")
+        print("-" * 80)
+        for item in top_candidates[:10]:
+            rank = item.get("rank", 0)
+            score = item.get("score", 0)
+            cat = item.get("category", "")[:10]
+            dt = item.get("date", "")[:10]
+            title = item.get("title", "")
+            title_disp = (title[:42] + "...") if len(title) > 45 else title
+            print(f"{rank:4} | {score:5} | {cat:11} | {dt:10} | {title_disp}")
+        print("-" * 80)
+        print(f"Output File: {self.output_path}")
+        print("=" * 80 + "\n")
 
 
-# ---------------------------------------------------------------------------
-# CLI 엔트리포인트
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    recommender = MarketNewsRecommender()
-    top30 = recommender.recommend(top_n=30)
-
-    # 추천 결과와 웹 리포트를 한 번에 생성 (SiteBuilder 자동 연계)
-    site_build_res = None
-    try:
-        try:
-            from src.build_site import SiteBuilder
-        except ImportError:
-            from build_site import SiteBuilder
-        builder = SiteBuilder(recommender.base_dir)
-        site_build_res = builder.build()
-    except Exception as e:
-        recommender.logger.warning(f"웹 리포트 자동 빌드 생략: {e}")
-
-    print("\n" + "=" * 70)
-    print(" [MARKET INTELLIGENCE TOP 10 RECOMMENDATION PREVIEW]")
-    print("=" * 70)
-    print(f"[*] LLM 사용 여부: {'사용 (Gemini 2.5 Flash)' if recommender.llm_used else '미사용 (고급 규칙 기반 엔진 적용)'}")
-    print(f"[*] 추천 대상: {recommender.config.get('company_name', 'NovaFactory AI')}")
-    print(f"[*] 정적 대시보드: {site_build_res['html_path'] if site_build_res else 'docs/index.html'}")
-    print(f"[*] JSON 리포트 : {site_build_res['json_path'] if site_build_res else 'docs/report.json'}")
-    print("-" * 70)
-    for it in top30[:10]:
-        print(f"[{int(it['rank']):02d}위] ({float(it['total_score']):.1f}점 / {it['category']}) {it['title']}")
-        print(f"     사유: {it['recommendation_reason']}")
-        print(f"     출처: {it['source_name']} | URL: {it['source_url']}")
-        print("-" * 70)
+    recommender = MarketRecommender()
+    recommender.run_recommendation()

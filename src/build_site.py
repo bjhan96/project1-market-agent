@@ -1,13 +1,8 @@
-"""
-Market & Competitor Intelligence Static Site Builder (정적 웹 대시보드 빌더)
+"""Static Site and Report Builder for NovaFactory AI Market Dashboard.
 
-- 입력:
-  - data/processed/recommended_market_news.csv (상위 30건)
-  - data/processed/cleaned_market_news.csv (전체 572건)
-  - config/company_profile.yaml
-- 출력:
-  - docs/index.html (GitHub Pages용 정적 대시보드)
-  - docs/report.json (머신 리더블 JSON 리포트)
+Reads recommended_market_news.csv and company_profile.yaml to generate:
+1. docs/report.json (machine-readable analytical report)
+2. docs/index.html (modern, responsive GitHub Pages static dashboard)
 """
 
 import os
@@ -15,403 +10,402 @@ import sys
 import csv
 import json
 import logging
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Tuple
-
+from datetime import datetime
+from typing import Dict, List, Any
 import yaml
 
-# Windows 콘솔 출력 인코딩 안전화
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
+# Setup logging
+LOG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOG_DIR, "build_site.log")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("SiteBuilder")
 
 
-def setup_logging(log_dir: Path) -> logging.Logger:
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "build_site.log"
+class DashboardBuilder:
+    """Builds static web dashboard and JSON report for GitHub Pages."""
 
-    logger = logging.getLogger("SiteBuilder")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
+    def __init__(
+        self,
+        config_path: str = "config/company_profile.yaml",
+        recommended_csv: str = "data/processed/recommended_market_news.csv",
+        cleaned_csv: str = "data/processed/cleaned_market_news.csv",
+        output_dir: str = "docs"
+    ):
+        self.config_path = config_path
+        self.recommended_csv = recommended_csv
+        self.cleaned_csv = cleaned_csv
+        self.output_dir = output_dir
 
-    formatter = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        self.html_path = os.path.join(output_dir, "index.html")
+        self.json_path = os.path.join(output_dir, "report.json")
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setLevel(logging.INFO)
-    ch.setFormatter(formatter)
-    logger.addHandler(ch)
+        self.profile = self._load_profile()
+        self.recommended_articles = self._load_csv(self.recommended_csv)
+        self.total_cleaned_count = self._count_cleaned_csv()
 
-    fh = logging.FileHandler(log_file, encoding="utf-8")
-    fh.setLevel(logging.INFO)
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
+    def _load_profile(self) -> Dict[str, Any]:
+        """Loads company profile YAML."""
+        if os.path.exists(self.config_path):
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        return {}
 
-    return logger
+    def _load_csv(self, path: str) -> List[Dict[str, Any]]:
+        """Loads CSV data."""
+        if not os.path.exists(path):
+            logger.warning(f"CSV file not found: {path}")
+            return []
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return list(csv.DictReader(f))
 
+    def _count_cleaned_csv(self) -> int:
+        """Counts total rows in cleaned_market_news.csv."""
+        if os.path.exists(self.cleaned_csv):
+            with open(self.cleaned_csv, "r", encoding="utf-8-sig") as f:
+                return sum(1 for _ in csv.DictReader(f))
+        return len(self.recommended_articles)
 
-class SiteBuilder:
-    def __init__(self, base_dir: Path = None):
-        if base_dir is None:
-            current_file = Path(__file__).resolve()
-            if (current_file.parent.parent / "config" / "company_profile.yaml").exists():
-                self.base_dir = current_file.parent.parent
-            elif (current_file.parent.parent / "project1" / "config" / "company_profile.yaml").exists():
-                self.base_dir = current_file.parent.parent / "project1"
-            else:
-                self.base_dir = Path.cwd()
-        else:
-            self.base_dir = base_dir
+    def generate_report_json(self) -> Dict[str, Any]:
+        """Generates docs/report.json with structured metrics."""
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        self.config_path = self.base_dir / "config" / "company_profile.yaml"
-        self.recommended_file = self.base_dir / "data" / "processed" / "recommended_market_news.csv"
-        self.cleaned_file = self.base_dir / "data" / "processed" / "cleaned_market_news.csv"
-        self.docs_dir = self.base_dir / "docs"
-        self.log_dir = self.base_dir / "logs"
+        # Compute category distribution
+        cat_counts: Dict[str, int] = {}
+        for a in self.recommended_articles:
+            c = a.get("category", "unknown")
+            cat_counts[c] = cat_counts.get(c, 0) + 1
 
-        self.logger = setup_logging(self.log_dir)
-        self.config = self._load_config()
+        scores = [int(a.get("score", 0)) for a in self.recommended_articles if a.get("score")]
+        avg_score = round(sum(scores) / len(scores), 1) if scores else 0
+        max_score = max(scores) if scores else 0
 
-    def _load_config(self) -> Dict[str, Any]:
-        if not self.config_path.exists():
-            return {
-                "company_name": "NovaFactory AI",
-                "business_area": "제조업 AI 비전 품질검사",
-                "products": ["비전 기반 불량 탐지 SaaS", "제조 품질 리포트 자동화", "엣지 AI 품질 분석 솔루션"],
-                "target_market": ["중소·중견 제조기업", "스마트팩토리 구축 기업", "반도체/전자부품 외관 검사 공정"],
-                "competitors": ["VisionForge", "InspectAI", "FactoryMind", "QualiBot"]
-            }
-        with open(self.config_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+        # LLM evaluation flag
+        llm_used = any(a.get("llm_evaluated", "false").lower() == "true" for a in self.recommended_articles)
 
-    def load_data(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        if not self.recommended_file.exists():
-            raise FileNotFoundError(f"추천 파일이 없습니다: {self.recommended_file}. 먼저 recommender.py를 실행하세요.")
-
-        with open(self.recommended_file, "r", encoding="utf-8") as f:
-            recommended = list(csv.DictReader(f))
-
-        cleaned = []
-        if self.cleaned_file.exists():
-            with open(self.cleaned_file, "r", encoding="utf-8") as f:
-                cleaned = list(csv.DictReader(f))
-
-        return recommended, cleaned
-
-    def generate_report_json(self, recommended: List[Dict[str, Any]], cleaned: List[Dict[str, Any]], llm_used: bool = False) -> Path:
-        """docs/report.json 생성"""
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
-        report_file = self.docs_dir / "report.json"
-
-        # 카테고리 통계
-        all_cat_counts = {}
-        for r in cleaned:
-            c = r.get("category", "unknown")
-            all_cat_counts[c] = all_cat_counts.get(c, 0) + 1
-
-        top30_cat_counts = {}
-        for r in recommended:
-            c = r.get("category", "unknown")
-            top30_cat_counts[c] = top30_cat_counts.get(c, 0) + 1
-
-        top_10 = recommended[:10]
+        top_10 = self.recommended_articles[:10]
 
         report_data = {
             "metadata": {
-                "generated_at": datetime.now(timezone(timedelta(hours=9))).isoformat(),
-                "company_name": self.config.get("company_name", "NovaFactory AI"),
-                "business_area": self.config.get("business_area", "제조업 AI 비전 품질검사"),
-                "total_analyzed_count": len(cleaned),
-                "recommended_count": len(recommended),
-                "llm_used": llm_used,
-                "engine_type": "Gemini 2.5 Flash LLM Ensemble" if llm_used else "Multi-dimensional Rule-based Intelligence Engine"
+                "generated_at": datetime.now().isoformat(),
+                "total_crawled_cleaned": self.total_cleaned_count,
+                "recommended_count": len(self.recommended_articles),
+                "top_10_count": len(top_10),
+                "llm_evaluated": llm_used,
+                "evaluation_mode": "Gemini LLM Enhanced" if llm_used else "Rule-based Semantic Engine",
+                "max_score": max_score,
+                "avg_score": avg_score
             },
-            "statistics": {
-                "total_category_distribution": all_cat_counts,
-                "top30_category_distribution": top30_cat_counts,
-                "highest_score": float(recommended[0]["total_score"]) if recommended else 0.0,
-                "average_top10_score": round(sum(float(x["total_score"]) for x in top_10) / len(top_10), 1) if top_10 else 0.0
+            "company_profile": {
+                "company_name": self.profile.get("company_name", "NovaFactory AI"),
+                "business_area": self.profile.get("business_area", "제조업 AI 비전 품질검사"),
+                "products": self.profile.get("products", []),
+                "target_market": self.profile.get("target_market", []),
+                "competitors": self.profile.get("competitors", []),
+                "interest_keywords": self.profile.get("interest_keywords", [])
             },
-            "top_10": top_10,
-            "recommended_30": recommended
+            "category_distribution": cat_counts,
+            "top_10": [
+                {
+                    "rank": int(a.get("rank", idx + 1)),
+                    "article_id": a.get("article_id", ""),
+                    "score": int(a.get("score", 0)),
+                    "category": a.get("category", ""),
+                    "title": a.get("title", ""),
+                    "date": a.get("date", ""),
+                    "source_name": a.get("source_name", ""),
+                    "source_url": a.get("source_url", ""),
+                    "recommendation_reason": a.get("recommendation_reason", ""),
+                    "urgency": a.get("urgency", "중(Medium)"),
+                    "keywords": a.get("keywords", "")
+                }
+                for idx, a in enumerate(top_10)
+            ],
+            "all_recommendations": self.recommended_articles
         }
 
-        with open(report_file, "w", encoding="utf-8") as f:
+        with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(report_data, f, ensure_ascii=False, indent=2)
 
-        self.logger.info(f"docs/report.json 저장 완료: {report_file}")
+        logger.info(f"Report JSON generated: {self.json_path}")
+        return report_data
 
-        try:
-            alt = self.base_dir.parent / "docs" / "report.json" if "project1" in str(self.base_dir) else self.base_dir / "project1" / "docs" / "report.json"
-            alt.parent.mkdir(parents=True, exist_ok=True)
-            with open(alt, "w", encoding="utf-8") as f:
-                json.dump(report_data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+    def generate_index_html(self, report_data: Dict[str, Any]) -> None:
+        """Generates modern, responsive docs/index.html dashboard for GitHub Pages."""
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        return report_file
+        meta = report_data["metadata"]
+        comp_profile = report_data["company_profile"]
+        cat_dist = report_data["category_distribution"]
+        top_10 = report_data["top_10"]
+        all_articles = report_data["all_recommendations"]
 
-    def generate_html_dashboard(self, recommended: List[Dict[str, Any]], cleaned: List[Dict[str, Any]], llm_used: bool = False) -> Path:
-        """docs/index.html 정적 대시보드 생성"""
-        self.docs_dir.mkdir(parents=True, exist_ok=True)
-        html_file = self.docs_dir / "index.html"
-
-        company_name = self.config.get("company_name", "NovaFactory AI")
-        business_area = self.config.get("business_area", "제조업 AI 비전 품질검사")
-        total_analyzed = len(cleaned)
-        recommended_count = len(recommended)
-        highest_score = recommended[0]["total_score"] if recommended else "0"
-        engine_label = "Gemini 2.5 Flash + Rule Ensemble" if llm_used else "Rule-based Intelligence Engine"
-
-        top30_cat_counts = {}
-        for r in recommended:
-            c = r.get("category", "unknown")
-            top30_cat_counts[c] = top30_cat_counts.get(c, 0) + 1
-
-        top_10 = recommended[:10]
-
-        cat_meta = {
-            "competitor": {"label": "경쟁사 동향", "bg": "bg-rose-500", "text": "text-rose-600", "border": "border-rose-200", "badge": "bg-rose-100 text-rose-800"},
-            "technology": {"label": "기술 동향", "bg": "bg-blue-500", "text": "text-blue-600", "border": "border-blue-200", "badge": "bg-blue-100 text-blue-800"},
-            "market": {"label": "시장 트렌드", "bg": "bg-emerald-500", "text": "text-emerald-600", "border": "border-emerald-200", "badge": "bg-emerald-100 text-emerald-800"},
-            "funding": {"label": "정부지원/펀딩", "bg": "bg-amber-500", "text": "text-amber-600", "border": "border-amber-200", "badge": "bg-amber-100 text-amber-800"},
-            "policy": {"label": "정책/규제", "bg": "bg-purple-500", "text": "text-purple-600", "border": "border-purple-200", "badge": "bg-purple-100 text-purple-800"}
+        # Category colors mapping
+        cat_badge_classes = {
+            "competitor": "bg-purple-100 text-purple-800 border-purple-200",
+            "technology": "bg-blue-100 text-blue-800 border-blue-200",
+            "funding": "bg-emerald-100 text-emerald-800 border-emerald-200",
+            "market": "bg-amber-100 text-amber-800 border-amber-200",
+            "policy": "bg-indigo-100 text-indigo-800 border-indigo-200"
         }
 
-        top10_html = ""
-        for item in top_10:
-            rank = int(item.get("rank", 1))
-            score = float(item.get("total_score", 0))
-            cat = item.get("category", "market")
-            cm = cat_meta.get(cat, {"label": cat, "badge": "bg-slate-100 text-slate-800", "text": "text-slate-600", "bg": "bg-slate-500"})
+        # JSON data for client-side filtering
+        articles_json = json.dumps(all_articles, ensure_ascii=False)
 
-            if rank == 1:
-                rank_badge = "bg-amber-500 text-white font-extrabold ring-4 ring-amber-100 shadow-md"
-                card_border = "border-amber-300 ring-1 ring-amber-200"
-            elif rank == 2:
-                rank_badge = "bg-slate-400 text-white font-bold ring-4 ring-slate-100 shadow"
-                card_border = "border-slate-300"
-            elif rank == 3:
-                rank_badge = "bg-amber-700 text-white font-bold ring-4 ring-amber-50 shadow"
-                card_border = "border-amber-200"
-            else:
-                rank_badge = "bg-indigo-50 text-indigo-700 font-semibold"
-                card_border = "border-slate-200 hover:border-indigo-200"
+        # Build Top 10 HTML Cards
+        top10_html = []
+        for a in top_10:
+            rank = a["rank"]
+            score = a["score"]
+            cat = a["category"]
+            title = a["title"]
+            date = a["date"]
+            source = a["source_name"]
+            url = a["source_url"]
+            reason = a["recommendation_reason"]
+            kws = a["keywords"]
+            badge_class = cat_badge_classes.get(cat.lower(), "bg-gray-100 text-gray-800 border-gray-200")
 
-            top10_html += f"""
-            <div class="bg-white rounded-2xl p-6 border {card_border} shadow-sm hover:shadow-lg transition-all duration-300 flex flex-col justify-between">
-                <div>
-                    <div class="flex items-center justify-between mb-3">
-                        <div class="flex items-center gap-2">
-                            <span class="w-8 h-8 rounded-xl flex items-center justify-center text-sm {rank_badge}">{rank:02d}</span>
-                            <span class="text-xs px-2.5 py-1 rounded-full font-semibold {cm['badge']}">{cm['label']}</span>
-                        </div>
-                        <div class="flex items-center gap-1.5">
-                            <span class="text-xs text-slate-400 font-medium">적합도</span>
-                            <span class="text-base font-extrabold {cm['text']}">{score:.1f}점</span>
-                        </div>
+            rank_badge_color = "bg-amber-500 text-white" if rank == 1 else (
+                "bg-slate-400 text-white" if rank == 2 else (
+                    "bg-amber-700 text-white" if rank == 3 else "bg-slate-200 text-slate-700"
+                )
+            )
+
+            card = f"""
+            <div class="bg-white rounded-xl border border-slate-200 p-5 shadow-sm hover:shadow-md transition-all">
+                <div class="flex items-start justify-between gap-3 mb-2">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <span class="inline-flex items-center justify-center w-7 h-7 rounded-full text-xs font-bold {rank_badge_color}">
+                            #{rank}
+                        </span>
+                        <span class="px-2.5 py-0.5 text-xs font-medium rounded-full border {badge_class}">
+                            {cat.upper()}
+                        </span>
+                        <span class="text-xs text-slate-500">
+                            {source} · {date}
+                        </span>
                     </div>
-
-                    <div class="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden mb-4">
-                        <div class="{cm['bg']} h-full rounded-full" style="width: {min(100, score)}%"></div>
-                    </div>
-
-                    <h3 class="text-base font-bold text-slate-900 leading-snug mb-3 hover:text-indigo-600 transition-colors line-clamp-2">
-                        {item.get('title')}
-                    </h3>
-
-                    <div class="p-3.5 bg-slate-50 rounded-xl border border-slate-100 text-xs text-slate-700 leading-relaxed mb-4">
-                        <div class="font-semibold text-slate-900 mb-1 flex items-center gap-1.5">
-                            <svg class="w-3.5 h-3.5 text-indigo-500" fill="currentColor" viewBox="0 0 20 20"><path d="M10 2a8 8 0 100 16 8 8 0 000-16zm1 11H9v-2h2v2zm0-4H9V5h2v4z"/></svg>
-                            맞춤형 추천 사유
-                        </div>
-                        {item.get('recommendation_reason')}
+                    <div class="flex items-center gap-1 bg-blue-50 text-blue-700 px-2.5 py-1 rounded-full text-xs font-bold border border-blue-100 shrink-0">
+                        <span>점수</span>
+                        <span class="text-sm font-extrabold">{score}</span>
                     </div>
                 </div>
 
-                <div class="pt-3 border-t border-slate-100 flex items-center justify-between text-xs">
-                    <span class="text-slate-500 font-medium truncate max-w-[150px]">{item.get('source_name')} · {item.get('date')}</span>
-                    <a href="{item.get('source_url')}" target="_blank" rel="noopener noreferrer" class="inline-flex items-center gap-1 px-3 py-1.5 bg-indigo-50 text-indigo-700 hover:bg-indigo-600 hover:text-white rounded-lg font-semibold transition-all">
+                <h3 class="text-base font-bold text-slate-900 mb-2 leading-snug">
+                    <a href="{url}" target="_blank" rel="noopener noreferrer" class="hover:text-blue-600 transition-colors">
+                        {title}
+                    </a>
+                </h3>
+
+                <div class="bg-slate-50 rounded-lg p-3.5 mb-3 border border-slate-100">
+                    <div class="text-xs font-bold text-slate-700 mb-1 flex items-center gap-1">
+                        <svg class="w-3.5 h-3.5 text-blue-600" fill="currentColor" viewBox="0 0 20 20">
+                            <path d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-11a1 1 0 10-2 0v2H7a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2V7z"/>
+                        </svg>
+                        맞춤 추천 이유 & 대응 방안
+                    </div>
+                    <p class="text-xs text-slate-600 leading-relaxed">
+                        {reason}
+                    </p>
+                </div>
+
+                <div class="flex items-center justify-between pt-2 border-t border-slate-100 text-xs">
+                    <div class="text-slate-400 truncate max-w-[70%]">
+                        태그: <span class="text-slate-600">{kws.replace('|', ', ') if kws else '제조 AI'}</span>
+                    </div>
+                    <a href="{url}" target="_blank" rel="noopener noreferrer" 
+                       class="inline-flex items-center gap-1 font-semibold text-blue-600 hover:text-blue-800 hover:underline">
                         <span>원문 보기</span>
-                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                        </svg>
                     </a>
                 </div>
             </div>
             """
+            top10_html.append(card)
 
-        table_rows_html = ""
-        for item in recommended:
-            rank = int(item.get("rank", 1))
-            score = float(item.get("total_score", 0))
-            cat = item.get("category", "market")
-            cm = cat_meta.get(cat, {"label": cat, "badge": "bg-slate-100 text-slate-800"})
+        top10_cards_rendered = "\n".join(top10_html)
 
-            table_rows_html += f"""
-            <tr class="hover:bg-slate-50 transition-colors border-b border-slate-100 text-xs group" data-category="{cat}">
-                <td class="py-3 px-4 font-bold text-slate-700 text-center">{rank}</td>
-                <td class="py-3 px-4 text-center">
-                    <span class="px-2 py-0.5 rounded-full font-semibold {cm['badge']}">{cm['label']}</span>
-                </td>
-                <td class="py-3 px-4 font-extrabold text-indigo-600 text-center">{score:.1f}</td>
-                <td class="py-3 px-4 text-slate-900 font-medium max-w-md">
-                    <div class="font-bold text-slate-900 group-hover:text-indigo-600 transition-colors mb-1">{item.get('title')}</div>
-                    <div class="text-slate-500 text-[11px] leading-tight line-clamp-1">{item.get('recommendation_reason')}</div>
-                </td>
-                <td class="py-3 px-4 text-slate-500 whitespace-nowrap text-center">{item.get('source_name')}</td>
-                <td class="py-3 px-4 text-slate-400 whitespace-nowrap text-center">{item.get('date')}</td>
-                <td class="py-3 px-4 text-center whitespace-nowrap">
-                    <a href="{item.get('source_url')}" target="_blank" rel="noopener noreferrer" class="text-indigo-600 hover:text-indigo-800 font-semibold inline-flex items-center gap-1 hover:underline">
-                        링크
-                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
-                    </a>
-                </td>
-            </tr>
-            """
+        # Build Category Pills
+        cat_pills_html = []
+        for cat, cnt in cat_dist.items():
+            badge_class = cat_badge_classes.get(cat.lower(), "bg-gray-100 text-gray-800 border-gray-200")
+            cat_pills_html.append(
+                f'<span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border {badge_class}">'
+                f'{cat.upper()} <b class="ml-0.5">{cnt}건</b></span>'
+            )
+        cat_pills_rendered = " ".join(cat_pills_html)
 
-        cat_stats_html = ""
-        for c, count in top30_cat_counts.items():
-            cm = cat_meta.get(c, {"label": c, "badge": "bg-slate-100 text-slate-800", "bg": "bg-slate-500", "text": "text-slate-600"})
-            pct = round(count / len(recommended) * 100, 1)
-            cat_stats_html += f"""
-            <div class="bg-white p-4 rounded-xl border border-slate-100 shadow-sm flex items-center justify-between">
-                <div>
-                    <div class="text-xs font-semibold text-slate-400 mb-1">{cm['label']}</div>
-                    <div class="text-xl font-extrabold text-slate-900">{count}<span class="text-xs text-slate-400 font-normal ml-1">건 ({pct}%)</span></div>
-                </div>
-                <div class="w-3 h-10 rounded-full {cm['bg']}"></div>
-            </div>
-            """
-
-        html_content = f"""<!DOCTYPE html>
+        html_template = f"""<!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{company_name} - 시장·경쟁사 인텔리전스 대시보드</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link rel="stylesheet" as="style" crossorigin href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.min.css" />
+    <title>{comp_profile['company_name']} 시장·경쟁사 인텔리전스 대시보드</title>
+    <!-- Tailwind CSS (Google allowlisted script) -->
+    <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
     <style>
-        body {{ font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, system-ui, Roboto, sans-serif; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f8fafc;
+        }}
     </style>
 </head>
-<body class="bg-slate-50 text-slate-800 min-h-screen">
+<body class="text-slate-800 antialiased min-h-screen">
 
-    <header class="bg-white border-b border-slate-200 sticky top-0 z-50 shadow-sm backdrop-blur-md bg-white/90">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-            <div class="flex items-center gap-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center text-white shadow-indigo-200 shadow-md">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+    <!-- Top Header -->
+    <header class="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+            <div class="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-blue-600 to-indigo-600 flex items-center justify-center text-white font-black text-lg shadow-md shadow-blue-500/20">
+                        N
+                    </div>
+                    <div>
+                        <div class="flex items-center gap-2">
+                            <h1 class="text-xl font-bold text-slate-900 tracking-tight">{comp_profile['company_name']}</h1>
+                            <span class="bg-blue-100 text-blue-700 text-xs px-2 py-0.5 rounded-full font-semibold">Market Agent</span>
+                        </div>
+                        <p class="text-xs text-slate-500">시장·경쟁사·정책 수집 및 맞춤형 인텔리전스 리포트</p>
+                    </div>
                 </div>
-                <div>
-                    <h1 class="text-lg font-bold text-slate-900 leading-tight">{company_name} Intelligence Hub</h1>
-                    <p class="text-xs text-slate-500">{business_area} 맞춤형 실시간 시장·경쟁사 리포트</p>
+                <div class="flex items-center gap-3 text-xs text-slate-500">
+                    <span class="flex items-center gap-1.5 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-200">
+                        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                        생성 일시: <b>{meta['generated_at'][:10]}</b>
+                    </span>
+                    <a href="report.json" target="_blank" 
+                       class="inline-flex items-center gap-1 bg-slate-900 hover:bg-slate-800 text-white px-3 py-1.5 rounded-lg font-medium transition-colors shadow-sm">
+                        <span>report.json API</span>
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                        </svg>
+                    </a>
                 </div>
-            </div>
-            <div class="flex items-center gap-2">
-                <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                    <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    Live Dashboard
-                </span>
-                <a href="report.json" target="_blank" class="px-3 py-1.5 text-xs font-semibold text-slate-600 hover:text-indigo-600 bg-slate-100 hover:bg-indigo-50 rounded-lg transition-colors border border-slate-200">
-                    report.json API
-                </a>
             </div>
         </div>
     </header>
 
     <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
 
-        <section class="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div class="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                <div class="text-xs font-semibold text-slate-400 mb-1">총 수집 분석 기사</div>
-                <div class="text-2xl font-black text-slate-900">{total_analyzed:,}<span class="text-sm font-normal text-slate-400 ml-1">건</span></div>
-                <div class="mt-2 text-[11px] text-emerald-600 font-semibold flex items-center gap-1">
-                    <span>100% 공개 Source 정제 완료</span>
+        <!-- Company Profile Briefing Card -->
+        <section class="bg-gradient-to-r from-slate-900 via-slate-800 to-indigo-950 text-white rounded-2xl p-6 shadow-xl relative overflow-hidden">
+            <div class="relative z-10 grid grid-cols-1 md:grid-cols-4 gap-6">
+                <div>
+                    <span class="text-xs font-semibold text-blue-400 uppercase tracking-wider">사업 분야</span>
+                    <h2 class="text-lg font-bold mt-1 text-slate-100">{comp_profile['business_area']}</h2>
+                    <p class="text-xs text-slate-400 mt-1">타깃: {', '.join(comp_profile['target_market'][:2])}</p>
                 </div>
-            </div>
-            <div class="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                <div class="text-xs font-semibold text-slate-400 mb-1">최종 선별 추천 기사</div>
-                <div class="text-2xl font-black text-indigo-600">{recommended_count}<span class="text-sm font-normal text-slate-400 ml-1">건</span></div>
-                <div class="mt-2 text-[11px] text-slate-500 font-medium">
-                    다면 적합도 상위 30건 엄선
+                <div>
+                    <span class="text-xs font-semibold text-indigo-400 uppercase tracking-wider">핵심 제품 라인업</span>
+                    <ul class="text-xs text-slate-300 mt-1 space-y-0.5">
+                        {''.join([f'<li>• {p}</li>' for p in comp_profile['products'][:2]])}
+                    </ul>
                 </div>
-            </div>
-            <div class="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                <div class="text-xs font-semibold text-slate-400 mb-1">최고 관련성 스코어</div>
-                <div class="text-2xl font-black text-rose-600">{highest_score}<span class="text-sm font-normal text-slate-400 ml-1">점</span></div>
-                <div class="mt-2 text-[11px] text-slate-500 font-medium">
-                    100점 만점 기준 평가
+                <div>
+                    <span class="text-xs font-semibold text-purple-400 uppercase tracking-wider">주요 모니터링 경쟁사</span>
+                    <div class="flex flex-wrap gap-1.5 mt-1.5">
+                        {''.join([f'<span class="bg-white/10 px-2 py-0.5 rounded text-xs text-slate-200">{c}</span>' for c in comp_profile['competitors']])}
+                    </div>
                 </div>
-            </div>
-            <div class="bg-white p-5 rounded-2xl border border-slate-200/80 shadow-sm">
-                <div class="text-xs font-semibold text-slate-400 mb-1">인텔리전스 엔진</div>
-                <div class="text-sm font-bold text-slate-800 truncate" title="{engine_label}">{engine_label}</div>
-                <div class="mt-2 text-[11px] text-indigo-600 font-semibold flex items-center gap-1">
-                    <span>기업 프로필 기반 4대 축 매칭</span>
+                <div>
+                    <span class="text-xs font-semibold text-emerald-400 uppercase tracking-wider">평가 엔진 상태</span>
+                    <div class="text-sm font-bold text-slate-100 mt-1">{meta['evaluation_mode']}</div>
+                    <div class="text-xs text-slate-400 mt-0.5">최대 관련도: <b class="text-amber-400">{meta['max_score']}점</b> (평균 {meta['avg_score']}점)</div>
                 </div>
             </div>
         </section>
 
-        <section class="space-y-3">
-            <h2 class="text-sm font-bold text-slate-500 uppercase tracking-wider">추천 기사 카테고리 구성 (TOP 30)</h2>
-            <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3">
-                {cat_stats_html}
+        <!-- KPI Metrics Grid -->
+        <section class="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                <span class="text-xs font-medium text-slate-500">총 수집/정제 기사</span>
+                <div class="text-2xl font-extrabold text-slate-900 mt-1">{meta['total_crawled_cleaned']} <span class="text-xs font-normal text-slate-500">건</span></div>
+                <span class="text-xs text-emerald-600 font-semibold mt-1 inline-block">100% 정상 전처리 완료</span>
+            </div>
+            <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                <span class="text-xs font-medium text-slate-500">맞춤 추천 기사</span>
+                <div class="text-2xl font-extrabold text-blue-600 mt-1">{meta['recommended_count']} <span class="text-xs font-normal text-slate-500">건</span></div>
+                <span class="text-xs text-slate-500 mt-1 inline-block">상위 선별 데이터셋</span>
+            </div>
+            <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                <span class="text-xs font-medium text-slate-500">TOP 10 우선순위</span>
+                <div class="text-2xl font-extrabold text-indigo-600 mt-1">10 <span class="text-xs font-normal text-slate-500">선</span></div>
+                <span class="text-xs text-indigo-600 font-semibold mt-1 inline-block">대응 방안 수립 대상</span>
+            </div>
+            <div class="bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                <span class="text-xs font-medium text-slate-500">추천 카테고리 다양성</span>
+                <div class="text-2xl font-extrabold text-purple-600 mt-1">{len(cat_dist)} <span class="text-xs font-normal text-slate-500">개 영역</span></div>
+                <span class="text-xs text-slate-500 mt-1 inline-block">시장·기술·지원·경쟁</span>
             </div>
         </section>
 
+        <!-- Category Breakdown Filter Bar -->
+        <section class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-wrap items-center justify-between gap-4">
+            <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-xs font-bold text-slate-600 mr-1">카테고리 분포:</span>
+                {cat_pills_rendered}
+            </div>
+            <div class="text-xs text-slate-500">
+                추천 상위 30건 기준 분포
+            </div>
+        </section>
+
+        <!-- TOP 10 Priorities Section -->
         <section class="space-y-4">
             <div class="flex items-center justify-between">
                 <div>
-                    <h2 class="text-xl font-black text-slate-900 tracking-tight flex items-center gap-2">
+                    <h2 class="text-lg font-bold text-slate-900 flex items-center gap-2">
                         <span>🔥 TOP 10 핵심 추천 인텔리전스</span>
                     </h2>
-                    <p class="text-xs text-slate-500 mt-0.5">NovaFactory AI 비즈니스와 가장 밀접한 상위 10대 핵심 기사 및 전략적 추천 사유</p>
+                    <p class="text-xs text-slate-500">관련도 점수 및 기업 파급효과가 가장 높은 최우선 모니터링 기사</p>
                 </div>
-                <span class="text-xs text-slate-400">실시간 순위 기준</span>
+                <span class="text-xs text-blue-600 font-medium">실시간 원문 링크 제공</span>
             </div>
 
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {top10_html}
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {top10_cards_rendered}
             </div>
         </section>
 
-        <section class="bg-white rounded-2xl border border-slate-200/80 shadow-sm overflow-hidden space-y-4 p-6">
-            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+        <!-- Full Recommendations Table (Top 30) -->
+        <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                 <div>
-                    <h2 class="text-lg font-bold text-slate-900">전체 추천 리스트 (TOP 30)</h2>
-                    <p class="text-xs text-slate-500">카테고리별 필터 및 검색으로 원하는 인텔리전스를 탐색하세요</p>
+                    <h2 class="text-base font-bold text-slate-900">전체 추천 기사 30선 (Interactive Table)</h2>
+                    <p class="text-xs text-slate-500">키워드 검색 및 카테고리 필터링이 가능합니다.</p>
                 </div>
-
                 <div class="flex items-center gap-2">
-                    <input type="text" id="searchInput" placeholder="제목/키워드 검색..." class="text-xs px-3 py-2 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 w-48">
-                    <select id="categoryFilter" class="text-xs px-3 py-2 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 bg-white">
-                        <option value="all">모든 카테고리</option>
-                        <option value="competitor">경쟁사 동향</option>
-                        <option value="technology">기술 동향</option>
-                        <option value="market">시장 트렌드</option>
-                        <option value="funding">정부지원/펀딩</option>
-                        <option value="policy">정책/규제</option>
-                    </select>
+                    <input type="text" id="searchInput" placeholder="기사 제목, 언론사, 키워드 검색..." 
+                           class="text-xs border border-slate-300 rounded-lg px-3 py-2 w-64 focus:outline-none focus:ring-2 focus:ring-blue-500">
                 </div>
             </div>
 
             <div class="overflow-x-auto">
-                <table class="w-full text-left border-collapse" id="dataTable">
-                    <thead>
-                        <tr class="bg-slate-50 text-[11px] font-bold text-slate-500 uppercase tracking-wider border-y border-slate-200">
-                            <th class="py-3 px-4 text-center w-12">순위</th>
-                            <th class="py-3 px-4 text-center w-28">카테고리</th>
-                            <th class="py-3 px-4 text-center w-16">점수</th>
-                            <th class="py-3 px-4">기사 제목 및 추천 사유</th>
-                            <th class="py-3 px-4 text-center w-28">출처</th>
-                            <th class="py-3 px-4 text-center w-24">발행일</th>
-                            <th class="py-3 px-4 text-center w-16">원문</th>
+                <table class="min-w-full divide-y divide-slate-200 text-left text-xs" id="recomTable">
+                    <thead class="bg-slate-50 text-slate-600 font-semibold">
+                        <tr>
+                            <th class="px-3 py-3 w-12 text-center">순위</th>
+                            <th class="px-3 py-3 w-16 text-center">점수</th>
+                            <th class="px-3 py-3 w-24">카테고리</th>
+                            <th class="px-4 py-3">기사 제목</th>
+                            <th class="px-3 py-3 w-28">출처 / 언론사</th>
+                            <th class="px-3 py-3 w-24">발행일</th>
+                            <th class="px-3 py-3 w-20 text-center">원문</th>
                         </tr>
                     </thead>
-                    <tbody class="divide-y divide-slate-100">
-                        {table_rows_html}
+                    <tbody class="divide-y divide-slate-100 text-slate-700" id="tableBody">
+                        <!-- Populated by JavaScript -->
                     </tbody>
                 </table>
             </div>
@@ -419,92 +413,87 @@ class SiteBuilder:
 
     </main>
 
-    <footer class="border-t border-slate-200 bg-white py-8 mt-12 text-center text-xs text-slate-500 space-y-2">
-        <p class="font-semibold text-slate-700">© 2026 {company_name} Market Agent. Built with Google Antigravity & GenAI.</p>
-        <p class="text-slate-400">본 대시보드는 GitHub Pages에 정적으로 호스팅될 수 있도록 완전히 자립된(Self-contained) 정적 파일로 구성되었습니다.</p>
+    <!-- Footer -->
+    <footer class="bg-white border-t border-slate-200 mt-12 py-6 text-center text-xs text-slate-500">
+        <p>© 2026 {comp_profile['company_name']}. Built with Google Antigravity & Market Agent Pipeline.</p>
+        <p class="mt-1">GitHub Pages Deployment Ready · Data Processed from Live Public Sources</p>
     </footer>
 
+    <!-- Client-side Search and Rendering Script -->
     <script>
-        const searchInput = document.getElementById('searchInput');
-        const categoryFilter = document.getElementById('categoryFilter');
-        const rows = document.querySelectorAll('#dataTable tbody tr');
+        const articles = {articles_json};
 
-        function filterTable() {{
-            const query = searchInput.value.toLowerCase();
-            const cat = categoryFilter.value;
-
-            rows.forEach(row => {{
-                const text = row.innerText.toLowerCase();
-                const rowCat = row.getAttribute('data-category');
-                const matchesQuery = text.includes(query);
-                const matchesCat = (cat === 'all' || rowCat === cat);
-
-                if (matchesQuery && matchesCat) {{
-                    row.style.display = '';
-                }} else {{
-                    row.style.display = 'none';
-                }}
+        function renderTable(data) {{
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+            if (data.length === 0) {{
+                tbody.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-slate-400">일치하는 추천 기사가 없습니다.</td></tr>';
+                return;
+            }}
+            data.forEach((item, idx) => {{
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-50 transition-colors';
+                tr.innerHTML = `
+                    <td class="px-3 py-3 text-center font-bold text-slate-500">#${{item.rank || (idx + 1)}}</td>
+                    <td class="px-3 py-3 text-center font-extrabold text-blue-600">${{item.score || 0}}</td>
+                    <td class="px-3 py-3">
+                        <span class="px-2 py-0.5 rounded text-[10px] font-semibold uppercase bg-slate-100 text-slate-700">
+                            ${{item.category}}
+                        </span>
+                    </td>
+                    <td class="px-4 py-3 font-medium text-slate-900">
+                        <a href="${{item.source_url}}" target="_blank" rel="noopener noreferrer" class="hover:text-blue-600 hover:underline">
+                            ${{item.title}}
+                        </a>
+                        <div class="text-[11px] text-slate-500 mt-0.5 line-clamp-1">${{item.recommendation_reason || ''}}</div>
+                    </td>
+                    <td class="px-3 py-3 text-slate-600">${{item.source_name || ''}}</td>
+                    <td class="px-3 py-3 text-slate-500">${{item.date ? item.date.slice(0, 10) : ''}}</td>
+                    <td class="px-3 py-3 text-center">
+                        <a href="${{item.source_url}}" target="_blank" rel="noopener noreferrer" 
+                           class="text-blue-600 hover:text-blue-800 font-semibold hover:underline">보기 ↗</a>
+                    </td>
+                `;
+                tbody.appendChild(tr);
             }});
         }}
 
-        searchInput.addEventListener('input', filterTable);
-        categoryFilter.addEventListener('change', filterTable);
+        // Initialize table
+        renderTable(articles);
+
+        // Search filter
+        document.getElementById('searchInput').addEventListener('input', function(e) {{
+            const q = e.target.value.toLowerCase().trim();
+            if (!q) {{
+                renderTable(articles);
+                return;
+            }}
+            const filtered = articles.filter(a => 
+                (a.title && a.title.toLowerCase().includes(q)) ||
+                (a.source_name && a.source_name.toLowerCase().includes(q)) ||
+                (a.category && a.category.toLowerCase().includes(q)) ||
+                (a.keywords && a.keywords.toLowerCase().includes(q)) ||
+                (a.recommendation_reason && a.recommendation_reason.toLowerCase().includes(q))
+            );
+            renderTable(filtered);
+        }});
     </script>
 </body>
 </html>
 """
+        with open(self.html_path, "w", encoding="utf-8") as f:
+            f.write(html_template)
 
-        with open(html_file, "w", encoding="utf-8") as f:
-            f.write(html_content)
+        logger.info(f"Dashboard HTML generated: {self.html_path}")
 
-        self.logger.info(f"docs/index.html 저장 완료: {html_file}")
-
-        try:
-            alt = self.base_dir.parent / "docs" / "index.html" if "project1" in str(self.base_dir) else self.base_dir / "project1" / "docs" / "index.html"
-            alt.parent.mkdir(parents=True, exist_ok=True)
-            with open(alt, "w", encoding="utf-8") as f:
-                f.write(html_content)
-        except Exception:
-            pass
-
-        return html_file
-
-    def build(self) -> Dict[str, Any]:
-        """정적 사이트 빌드 실행"""
-        self.logger.info("=========================================================")
-        self.logger.info(" [SiteBuilder] GitHub Pages 정적 리포트 빌드 시작")
-        self.logger.info("=========================================================")
-
-        recommended, cleaned = self.load_data()
-        llm_used = bool(os.environ.get("GEMINI_API_KEY"))
-
-        json_path = self.generate_report_json(recommended, cleaned, llm_used=llm_used)
-        html_path = self.generate_html_dashboard(recommended, cleaned, llm_used=llm_used)
-
-        self.logger.info("=========================================================")
-        self.logger.info(" [SiteBuilder 완료] 대시보드 빌드 성공")
-        self.logger.info(f" - JSON: {json_path}")
-        self.logger.info(f" - HTML: {html_path}")
-        self.logger.info("=========================================================")
-
-        return {
-            "html_path": str(html_path),
-            "json_path": str(json_path),
-            "total_recommended": len(recommended),
-            "top_10": recommended[:10],
-            "llm_used": llm_used
-        }
+    def build(self) -> None:
+        """Runs the complete site and report build process."""
+        logger.info("=== Starting Dashboard & Report Site Builder ===")
+        report_data = self.generate_report_json()
+        self.generate_index_html(report_data)
+        logger.info("=== Build Process Completed Successfully ===")
 
 
 if __name__ == "__main__":
-    builder = SiteBuilder()
-    res = builder.build()
-
-    print("\n" + "=" * 60)
-    print(" [STATIC SITE BUILD SUMMARY REPORT]")
-    print("=" * 60)
-    print(f"[*] 웹 대시보드 : {res['html_path']}")
-    print(f"[*] JSON 리포트 : {res['json_path']}")
-    print(f"[*] 추천 건수   : {res['total_recommended']}건")
-    print(f"[*] LLM 사용 여부: {'사용' if res['llm_used'] else '미사용 (규칙 기반)'}")
-    print("=" * 60)
+    builder = DashboardBuilder()
+    builder.build()
