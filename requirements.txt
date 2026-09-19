@@ -1,0 +1,17 @@
+# Project 1: Market Agent Dependencies
+
+# Configuration & Environment
+PyYAML>=6.0.2
+python-dotenv>=1.0.0
+pydantic>=2.10.0
+
+# HTTP & Web Scraping
+requests>=2.32.0
+httpx>=0.28.0
+beautifulsoup4>=4.12.0
+
+# LLM & AI
+google-genai>=2.0.0
+
+# Testing & Quality
+pytest>=8.0.0

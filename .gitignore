@@ -1,0 +1,28 @@
+# Environment variables & secrets (민감정보 보호)
+.env
+.env.*
+!.env.example
+*.env
+**/.env
+
+# Starter zip & temporary extraction
+*.zip
+project1_market_agent_starter/
+
+# Python cache & virtual environment
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs (log 파일만 제외하고 .md, .gitkeep은 포함)
+logs/*.log
+*.log
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

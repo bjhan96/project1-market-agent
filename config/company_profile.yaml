@@ -1,0 +1,47 @@
+# 기업 기본 정보 및 시장/경쟁사 모니터링 수집 기준 설정
+
+# 1. 기업 기본 정보 (Company Profile)
+company_name: "NovaFactory AI"
+business_area: "제조업 AI 비전 품질검사"
+
+# 2. 주요 제품 및 서비스 (Products & Services)
+products:
+  - "비전 기반 불량 탐지 SaaS"
+  - "제조 품질 리포트 자동화"
+  - "엣지 AI 품질 분석 솔루션"
+
+# 3. 타깃 시장 (Target Market)
+target_market:
+  - "중소·중견 제조기업"
+  - "스마트팩토리 구축 기업"
+  - "반도체/전자부품 외관 검사 공정"
+
+# 4. 주요 경쟁사 (Competitors - 최소 3개 이상 설정)
+competitors:
+  - "VisionForge"
+  - "InspectAI"
+  - "FactoryMind"
+  - "QualiBot"
+
+# 5. 시장 및 기술 관심 키워드 (Interest Keywords - 최소 5개 이상 설정)
+interest_keywords:
+  - "AI"
+  - "스마트팩토리"
+  - "품질검사"
+  - "자동화"
+  - "클라우드"
+  - "제조 AX"
+  - "디지털 전환"
+  - "머신비전"
+
+# 6. 지원사업 및 정부 펀딩 키워드 (Funding Keywords)
+funding_keywords:
+  - "창업지원"
+  - "AI 바우처"
+  - "스마트공장"
+  - "R&D"
+  - "사업화 자금"
+  - "중소기업 지원"
+
+# 7. 리포트 언어 설정
+report_language: "ko"
